@@ -148,7 +148,7 @@ function handleListModels(): Response {
       id,
       object: "model",
       created,
-      owned_by: "codex-sub-cursor",
+      owned_by: "codex-cursor",
     })),
   });
 }

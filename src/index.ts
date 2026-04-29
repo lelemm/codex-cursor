@@ -92,7 +92,7 @@ function parseLogLevel(value: string | undefined, fallback: LogLevel): LogLevel 
 }
 
 function printHelp(): void {
-  process.stdout.write(`codex-sub-cursor — OpenAI-compatible proxy backed by your Codex/ChatGPT subscription
+  process.stdout.write(`codex-cursor — OpenAI-compatible proxy backed by your Codex/ChatGPT subscription
 
 Usage:
   bun run src/index.ts [flags]
@@ -119,7 +119,7 @@ Cursor setup:
 const config = parseArgs(process.argv.slice(2));
 const server = startServer(config);
 console.log(
-  `codex-sub-cursor listening on http://${config.host}:${server.port}\n` +
+  `codex-cursor listening on http://${config.host}:${server.port}\n` +
     `  base URL for Cursor: http://${config.host}:${server.port}/v1\n` +
     `  auth required:       ${config.apiKey ? "yes" : "no"}\n` +
     `  reasoning effort:    ${config.defaultReasoningEffort} (used when client omits it; client choice wins otherwise)\n` +

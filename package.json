@@ -1,16 +1,41 @@
 {
-  "name": "codex-sub-cursor",
-  "version": "0.1.0",
+  "name": "codex-cursor",
+  "version": "0.0.1",
   "description": "Local OpenAI-compatible proxy that routes Cursor IDE traffic to your ChatGPT/Codex subscription via the codex CLI tokens.",
   "type": "module",
-  "private": true,
   "bin": {
-    "codex-sub-cursor": "src/index.ts"
+    "codex-cursor": "bin/cli.cjs"
   },
+  "files": [
+    "bin",
+    "src",
+    "README.md"
+  ],
   "scripts": {
     "start": "bun run src/index.ts",
     "dev": "bun --watch run src/index.ts",
     "typecheck": "bunx tsc --noEmit"
+  },
+  "keywords": [
+    "cursor",
+    "codex",
+    "chatgpt",
+    "openai",
+    "proxy",
+    "bun"
+  ],
+  "author": "Ephraim Duncan",
+  "license": "MIT",
+  "homepage": "https://github.com/ephraimduncan/codex-cursor#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ephraimduncan/codex-cursor.git"
+  },
+  "bugs": {
+    "url": "https://github.com/ephraimduncan/codex-cursor/issues"
+  },
+  "engines": {
+    "node": ">=18"
   },
   "devDependencies": {
     "@types/bun": "latest",

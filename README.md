@@ -1,4 +1,4 @@
-# codex-sub-cursor
+# codex-cursor
 
 Local OpenAI-compatible HTTP proxy that lets Cursor (or anything else that
 speaks the OpenAI Chat Completions API) consume your **ChatGPT/Codex
@@ -23,10 +23,23 @@ backend's Responses API at `https://chatgpt.com/backend-api/codex/responses`.
 ## Run it
 
 ```bash
+# one-shot, no install (pick one):
+bunx codex-cursor
+npx codex-cursor
+
+# or install globally:
+npm i -g codex-cursor
+codex-cursor --api-key "$(openssl rand -hex 16)"
+
+# from a clone:
 bun install
 bun run src/index.ts                            # local-only, no auth
 bun run src/index.ts --api-key "$(openssl rand -hex 16)"  # what you actually want for Cursor
 ```
+
+> `codex-cursor` runs the TypeScript source through [bun](https://bun.sh).
+> Both `bunx` and `npx` invocations require `bun` to be installed; the npm
+> launcher will exec `bun` from your `PATH`.
 
 Useful flags / env vars:
 
@@ -62,7 +75,7 @@ command:
 brew install cloudflared
 
 # in terminal A: run the proxy with auth required
-bun run src/index.ts --api-key "$(openssl rand -hex 16)"
+bunx codex-cursor --api-key "$(openssl rand -hex 16)"
 
 # in terminal B: tunnel :4141 to a public hostname
 cloudflared tunnel --url http://127.0.0.1:4141
@@ -99,10 +112,11 @@ way to the ChatGPT/Codex backend, and you'll see one log line per request.
 ## How it works
 
 ```
-Cursor  ──/v1/chat/completions──▶  codex-sub-cursor  ──/codex/responses──▶  chatgpt.com backend
-                                          │
-                                          └─ auth tokens from ~/.codex/auth.json
-                                             (refreshed via auth.openai.com/oauth/token)
+```
+Cursor  ──/v1/chat/completions──▶  codex-cursor  ──/codex/responses──▶  chatgpt.com backend
+                                       │
+                                       └─ auth tokens from ~/.codex/auth.json
+                                          (refreshed via auth.openai.com/oauth/token)
 ```
 
 - **Auth.** `src/auth.ts` reads `tokens.access_token` and `tokens.account_id`
