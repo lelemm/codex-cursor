@@ -1,6 +1,6 @@
 {
   "name": "codex-cursor",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "description": "Local OpenAI-compatible proxy that routes Cursor IDE traffic to your ChatGPT/Codex subscription via the codex CLI tokens.",
   "type": "module",
   "bin": {
