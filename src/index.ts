@@ -122,7 +122,7 @@ console.log(
   `codex-sub-cursor listening on http://${config.host}:${server.port}\n` +
     `  base URL for Cursor: http://${config.host}:${server.port}/v1\n` +
     `  auth required:       ${config.apiKey ? "yes" : "no"}\n` +
-    `  reasoning effort:    ${config.defaultReasoningEffort} (overrides client-supplied)\n` +
+    `  reasoning effort:    ${config.defaultReasoningEffort} (used when client omits it; client choice wins otherwise)\n` +
     `  log level:           ${config.logLevel}\n` +
     `  cursor needs a public URL \u2014 expose this with:\n` +
     `    cloudflared tunnel --url http://${config.host}:${server.port}`,

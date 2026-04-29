@@ -133,11 +133,13 @@ Cursor  ──/v1/chat/completions──▶  codex-sub-cursor  ──/codex/resp
   - Force `store: false` (the ChatGPT-auth endpoint refuses `store: true`).
   - Default `service_tier: "priority"` so requests land on the same fast
     queue the `codex` CLI uses.
-  - Override `reasoning.effort` with the value of `--reasoning-effort`
-    (default `xhigh`). Without this the flag would silently do nothing.
+  - **Honor the client's `reasoning.effort`.** Cursor sets it deliberately
+    per use case (chat / Tab / composer can want different efforts), so
+    we forward whatever it sent. `--reasoning-effort` is used only as a
+    fallback when the client doesn't supply one (e.g. raw curl tests).
 
-  The upstream SSE stream is then piped back to Cursor verbatim, modulo a
-  trailing `data: [DONE]\n\n` line.
+  The upstream Responses SSE stream is translated back into Chat Completions
+  stream chunks, then terminated with `data: [DONE]\n\n`.
 
 - **Headers.** Each upstream request carries the same identity headers the
   Codex CLI sends (`originator: codex_cli_rs`, a matching `User-Agent`,

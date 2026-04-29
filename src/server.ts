@@ -27,8 +27,9 @@ export type ServerConfig = {
   // `Authorization: Bearer <token>` matching this value (Cursor sends whatever
   // API key you configure into that header).
   apiKey?: string;
-  // Reasoning effort applied to every request; overrides the value Cursor
-  // sends in `reasoning.effort` so this flag actually does something.
+  // Fallback `reasoning.effort` applied only when the client doesn't supply
+  // one. Cursor's own choice wins so chat vs. Tab vs. composer keep their
+  // intended efforts.
   defaultReasoningEffort: ReasoningEffort;
   // Optional override for the auth.json path; defaults to ~/.codex/auth.json.
   authPath?: string;
@@ -221,15 +222,20 @@ async function* tapEvents(
   events: AsyncIterable<Record<string, unknown>>,
   onSummary: (usage: Usage | null, finishReason: string | null, serverModel: string | null) => void,
 ): AsyncIterable<Record<string, unknown>> {
+  let hadToolCall = false;
   for await (const event of events) {
+    if (event["type"] === "response.output_item.added") {
+      const item = event["item"] as Record<string, unknown> | undefined;
+      if (item?.["type"] === "function_call") hadToolCall = true;
+    }
     if (event["type"] === "response.completed") {
       const resp = event["response"] as Record<string, unknown> | undefined;
       const usage = usageFromCompleted(resp);
-      const status = (resp?.["status"] as string) ?? null;
       const model = (resp?.["model"] as string) ?? null;
-      // The Responses API uses `status` rather than `finish_reason`; map the
-      // common values onto OpenAI's chat-completions vocabulary.
-      const finish = mapStatusToFinishReason(status);
+      // Trust what we actually saw on the wire: if any function_call output
+      // item was announced, this turn ends as `tool_calls` regardless of how
+      // the upstream `response.status` is reported.
+      const finish = hadToolCall ? "tool_calls" : deriveFinishReason(resp);
       onSummary(usage, finish, model);
     }
     yield event;
@@ -247,6 +253,24 @@ function mapStatusToFinishReason(status: string | null): string | null {
     default:
       return status;
   }
+}
+
+// Like `mapStatusToFinishReason`, but inspects the completed response's
+// output for function_call items so chat-completions consumers (Cursor) see
+// the canonical `tool_calls` finish reason instead of a generic `stop`.
+function deriveFinishReason(
+  resp: Record<string, unknown> | undefined,
+): string | null {
+  const status =
+    typeof resp?.["status"] === "string" ? (resp!["status"] as string) : null;
+  const output = Array.isArray(resp?.["output"])
+    ? (resp!["output"] as unknown[])
+    : [];
+  for (const item of output) {
+    const it = item as Record<string, unknown> | undefined;
+    if (it?.["type"] === "function_call") return "tool_calls";
+  }
+  return mapStatusToFinishReason(status);
 }
 
 // Fields the Codex backend's Responses API accepts. Anything else (`user`,
@@ -269,8 +293,8 @@ const RESPONSES_ALLOWED_FIELDS = new Set([
   "client_metadata",
 ]);
 
-// Forwards a Responses-shaped request straight to the Codex backend and pipes
-// the SSE stream back to the caller. This is the path Cursor uses.
+// Forwards a Responses-shaped request to the Codex backend, then translates
+// the upstream Responses SSE events into Chat Completions chunks for Cursor.
 async function handleResponsesPassthrough(
   req: Request,
   ctx: RequestCtx,
@@ -327,6 +351,15 @@ async function handleResponsesPassthrough(
   let capturedUsage: Usage | null = null;
   let capturedFinishReason: string | null = null;
   let capturedServerModel: string | null = stream.serverModel;
+  const chatStreamState: ChatCompletionStreamState = {
+    id: `chatcmpl-${crypto.randomUUID()}`,
+    created: Math.floor(Date.now() / 1000),
+    model: typeof sanitized["model"] === "string" ? (sanitized["model"] as string) : "?",
+    sentRole: false,
+    toolCalls: new Map(),
+    nextSlot: 0,
+    hadToolCall: false,
+  };
 
   const sseStream = new ReadableStream<Uint8Array>({
     async start(controller) {
@@ -338,7 +371,8 @@ async function handleResponsesPassthrough(
           capturedServerModel = model ?? capturedServerModel;
         })) {
           if (abort.signal.aborted) break;
-          controller.enqueue(encoder.encode(formatResponsesEvent(event)));
+          const formatted = formatChatCompletionEvent(event, chatStreamState);
+          if (formatted) controller.enqueue(encoder.encode(formatted));
         }
         controller.enqueue(encoder.encode("data: [DONE]\n\n"));
         logger.complete({
@@ -349,11 +383,7 @@ async function handleResponsesPassthrough(
           usage: capturedUsage,
         });
       } catch (err) {
-        const errorEvent = {
-          type: "response.failed",
-          response: { error: { message: (err as Error).message } },
-        };
-        controller.enqueue(encoder.encode(formatResponsesEvent(errorEvent)));
+        controller.enqueue(encoder.encode(formatChatCompletionError((err as Error).message)));
         controller.enqueue(encoder.encode("data: [DONE]\n\n"));
         logger.complete({
           status: 502,
@@ -444,11 +474,14 @@ function sanitizeResponsesRequest(
   // mirror the codex CLI by using the per-process session id when Cursor
   // doesn't supply one.
   if (typeof out["prompt_cache_key"] !== "string") out["prompt_cache_key"] = sessionId;
-  // Override Cursor's chosen reasoning effort with the value the operator
-  // configured. Without this, --reasoning-effort would silently do nothing
-  // because Cursor always sets reasoning.effort itself.
-  const reasoning = (out["reasoning"] as Record<string, unknown> | undefined) ?? {};
-  out["reasoning"] = { ...reasoning, effort };
+  // Honor whatever `reasoning.effort` the client sent (Cursor picks it
+  // intentionally per use case \u2014 chat vs Tab vs composer can want
+  // different efforts). Fall back to the configured default only when the
+  // client didn't supply one, so direct curl tests still get a sensible
+  // value.
+  const reasoning = { ...((out["reasoning"] as Record<string, unknown> | undefined) ?? {}) };
+  if (typeof reasoning["effort"] !== "string") reasoning["effort"] = effort;
+  out["reasoning"] = reasoning;
   return out;
 }
 
@@ -495,10 +528,214 @@ function stringifyResponsesContent(content: unknown): string {
   return parts.join("");
 }
 
-function formatResponsesEvent(event: Record<string, unknown>): string {
-  const type = typeof event["type"] === "string" ? (event["type"] as string) : "";
-  const data = JSON.stringify(event);
-  return type ? `event: ${type}\ndata: ${data}\n\n` : `data: ${data}\n\n`;
+type ChatCompletionStreamState = {
+  id: string;
+  created: number;
+  model: string;
+  sentRole: boolean;
+  // Tracks the per-tool-call streaming slot that downstream consumers index
+  // chunks by. Keyed by the upstream Responses-API `item.id`.
+  toolCalls: Map<string, { slot: number; argsLen: number; callId: string; name: string }>;
+  nextSlot: number;
+  hadToolCall: boolean;
+};
+
+function formatChatCompletionEvent(
+  event: Record<string, unknown>,
+  state: ChatCompletionStreamState,
+): string | null {
+  updateChatCompletionState(event, state);
+
+  switch (event["type"]) {
+    case "response.created":
+      return formatAssistantRoleChunk(state);
+    case "response.output_text.delta": {
+      const delta = event["delta"];
+      if (typeof delta !== "string" || delta.length === 0) return null;
+      return (
+        formatAssistantRoleChunk(state) +
+        formatChatCompletionChunk(state, { content: delta }, null)
+      );
+    }
+    case "response.output_item.added":
+      return formatToolCallStart(event, state);
+    case "response.function_call_arguments.delta":
+      return formatToolCallArgsDelta(event, state);
+    case "response.output_item.done":
+      return formatToolCallDone(event, state);
+    case "response.completed": {
+      const resp = event["response"] as Record<string, unknown> | undefined;
+      const finish = state.hadToolCall
+        ? "tool_calls"
+        : deriveFinishReason(resp) ?? "stop";
+      return (
+        formatAssistantRoleChunk(state) +
+        formatChatCompletionChunk(state, {}, finish)
+      );
+    }
+    case "response.failed":
+      return formatChatCompletionError(extractResponseError(event));
+    default:
+      return null;
+  }
+}
+
+function updateChatCompletionState(
+  event: Record<string, unknown>,
+  state: ChatCompletionStreamState,
+): void {
+  const response = event["response"] as Record<string, unknown> | undefined;
+  const responseId =
+    typeof response?.["id"] === "string"
+      ? (response["id"] as string)
+      : typeof event["response_id"] === "string"
+        ? (event["response_id"] as string)
+        : null;
+  if (responseId) state.id = responseId;
+
+  if (typeof response?.["model"] === "string") state.model = response["model"] as string;
+
+  const createdAt = response?.["created_at"];
+  if (typeof createdAt === "number" && Number.isFinite(createdAt)) {
+    state.created = Math.floor(createdAt);
+  }
+}
+
+function formatAssistantRoleChunk(state: ChatCompletionStreamState): string {
+  if (state.sentRole) return "";
+  state.sentRole = true;
+  return formatChatCompletionChunk(state, { role: "assistant", content: "" }, null);
+}
+
+// Translates `response.output_item.added` (function_call variant) into the
+// initial chat-completions `tool_calls` chunk that announces a new call,
+// including its id and function name with empty arguments.
+function formatToolCallStart(
+  event: Record<string, unknown>,
+  state: ChatCompletionStreamState,
+): string | null {
+  const item = event["item"] as Record<string, unknown> | undefined;
+  if (!item || item["type"] !== "function_call") return null;
+  const itemId = typeof item["id"] === "string" ? (item["id"] as string) : null;
+  if (!itemId || state.toolCalls.has(itemId)) return null;
+  const slot = state.nextSlot++;
+  const callId =
+    typeof item["call_id"] === "string" ? (item["call_id"] as string) : itemId;
+  const name = typeof item["name"] === "string" ? (item["name"] as string) : "";
+  state.toolCalls.set(itemId, { slot, argsLen: 0, callId, name });
+  state.hadToolCall = true;
+  return (
+    formatAssistantRoleChunk(state) +
+    formatChatCompletionChunk(
+      state,
+      {
+        tool_calls: [
+          {
+            index: slot,
+            id: callId,
+            type: "function",
+            function: { name, arguments: "" },
+          },
+        ],
+      },
+      null,
+    )
+  );
+}
+
+// Streams an upstream `response.function_call_arguments.delta` as an
+// incremental `tool_calls[i].function.arguments` chunk on the matching slot.
+function formatToolCallArgsDelta(
+  event: Record<string, unknown>,
+  state: ChatCompletionStreamState,
+): string | null {
+  const delta = event["delta"];
+  if (typeof delta !== "string" || delta.length === 0) return null;
+  const itemId =
+    typeof event["item_id"] === "string" ? (event["item_id"] as string) : null;
+  if (!itemId) return null;
+  const tc = state.toolCalls.get(itemId);
+  if (!tc) return null;
+  tc.argsLen += delta.length;
+  return formatChatCompletionChunk(
+    state,
+    { tool_calls: [{ index: tc.slot, function: { arguments: delta } }] },
+    null,
+  );
+}
+
+// Fallback for backends that don't stream argument deltas: when an
+// `response.output_item.done` carries a function_call whose args we never
+// forwarded, emit the full arguments string in one chunk.
+function formatToolCallDone(
+  event: Record<string, unknown>,
+  state: ChatCompletionStreamState,
+): string | null {
+  const item = event["item"] as Record<string, unknown> | undefined;
+  if (!item || item["type"] !== "function_call") return null;
+  const itemId = typeof item["id"] === "string" ? (item["id"] as string) : null;
+  if (!itemId) return null;
+  const tc = state.toolCalls.get(itemId);
+  if (!tc) return null;
+  if (tc.argsLen > 0) return null;
+  const args = item["arguments"];
+  if (typeof args !== "string" || args.length === 0) return null;
+  tc.argsLen = args.length;
+  return formatChatCompletionChunk(
+    state,
+    { tool_calls: [{ index: tc.slot, function: { arguments: args } }] },
+    null,
+  );
+}
+
+function formatChatCompletionChunk(
+  state: ChatCompletionStreamState,
+  delta: Record<string, unknown>,
+  finishReason: string | null,
+): string {
+  return (
+    `data: ${JSON.stringify({
+      id: state.id,
+      object: "chat.completion.chunk",
+      created: state.created,
+      model: state.model,
+      choices: [
+        {
+          index: 0,
+          delta,
+          logprobs: null,
+          finish_reason: finishReason,
+        },
+      ],
+    })}\n\n`
+  );
+}
+
+function formatChatCompletionError(message: string): string {
+  return (
+    `data: ${JSON.stringify({
+      error: {
+        message,
+        type: "server_error",
+        code: null,
+      },
+    })}\n\n`
+  );
+}
+
+function extractResponseError(event: Record<string, unknown>): string {
+  const response = event["response"] as Record<string, unknown> | undefined;
+  const responseError = response?.["error"] as Record<string, unknown> | undefined;
+  if (typeof responseError?.["message"] === "string") {
+    return responseError["message"] as string;
+  }
+
+  const eventError = event["error"] as Record<string, unknown> | undefined;
+  if (typeof eventError?.["message"] === "string") {
+    return eventError["message"] as string;
+  }
+
+  return "response failed";
 }
 
 function extractInputPreview(input: unknown): string | null {
