@@ -1,0 +1,19 @@
+{
+  "name": "codex-sub-cursor",
+  "version": "0.1.0",
+  "description": "Local OpenAI-compatible proxy that routes Cursor IDE traffic to your ChatGPT/Codex subscription via the codex CLI tokens.",
+  "type": "module",
+  "private": true,
+  "bin": {
+    "codex-sub-cursor": "src/index.ts"
+  },
+  "scripts": {
+    "start": "bun run src/index.ts",
+    "dev": "bun --watch run src/index.ts",
+    "typecheck": "bunx tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5.4.0"
+  }
+}

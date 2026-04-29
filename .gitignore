@@ -1,0 +1,7 @@
+node_modules
+bun.lockb
+bun.lock
+.DS_Store
+.env
+.env.local
+*.log
