@@ -464,6 +464,13 @@ function sanitizeResponsesRequest(
   const lifted = liftSystemInstructions(out["input"], out["instructions"]);
   out["input"] = lifted.input;
   if (lifted.instructions) out["instructions"] = lifted.instructions;
+  // Cursor's "fast mode" appends `-extra` to the model slug (e.g.
+  // `gpt-5.5-extra`); the Codex/ChatGPT backend rejects that suffix as an
+  // unsupported model. Strip it before forwarding -- the priority service
+  // tier we already set below preserves the fast-queue intent.
+  if (typeof out["model"] === "string" && (out["model"] as string).endsWith("-extra")) {
+    out["model"] = (out["model"] as string).slice(0, -"-extra".length);
+  }
   // The codex backend wants `store: false` for ChatGPT-auth flows; the
   // backend will reject `store: true` with a workspace error.
   out["store"] = false;
