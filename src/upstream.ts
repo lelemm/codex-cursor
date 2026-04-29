@@ -60,6 +60,21 @@ export class UpstreamClient {
     accessToken: string,
     accountId: string,
   ): Promise<Response> {
+    // Per cliproxyapi #2373: the Codex backend stitches a turn's reasoning
+    // continuity to whichever value the client uses for `session_id` and the
+    // body's `prompt_cache_key`. When they disagree (Cursor mints a new
+    // `prompt_cache_key` per conversation, we used to send a single
+    // per-process UUID in the header), the backend treats every turn as fresh
+    // and the model degrades to text answers instead of tool calls. Mirror
+    // the body's key into the header so the two stay aligned.
+    const body =
+      typeof opts.body === "object" && opts.body !== null
+        ? (opts.body as Record<string, unknown>)
+        : null;
+    const promptCacheKey =
+      typeof body?.["prompt_cache_key"] === "string"
+        ? (body["prompt_cache_key"] as string)
+        : opts.sessionId;
     const headers: Record<string, string> = {
       "content-type": "application/json",
       accept: "text/event-stream",
@@ -68,7 +83,7 @@ export class UpstreamClient {
       "openai-beta": "responses=experimental",
       originator: ORIGINATOR,
       "user-agent": `${ORIGINATOR}/${CODEX_USER_AGENT_VERSION} (codex-sub-cursor)`,
-      "session_id": opts.sessionId,
+      session_id: promptCacheKey,
       "x-codex-installation-id": opts.sessionId,
     };
     return fetch(RESPONSES_URL, {
