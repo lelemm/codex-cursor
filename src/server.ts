@@ -5,16 +5,9 @@
 // session inside Cursor consumes your Codex/ChatGPT subscription instead of a
 // metered OpenAI API key.
 
-
-
 import { CodexAuth } from "./auth.ts";
-import {
-  type LogLevel,
-  RequestLogger,
-  usageFromCompleted,
-  type Usage,
-} from "./log.ts";
-import { UpstreamClient, UpstreamError } from "./upstream.ts";
+import { type LogLevel, RequestLogger, usageFromCompleted, type Usage } from "./log.ts";
+import { UpstreamClient, UpstreamError, type UpstreamStream } from "./upstream.ts";
 
 // Mirrors the Codex CLI's reasoning effort enum (codex-rs/protocol/openai_models.rs).
 // `xhigh` is a Codex-only level above OpenAI's public `high`.
@@ -157,10 +150,7 @@ function handleListModels(): Response {
 // targets. Cursor 1.0+ sends Responses-API-shaped bodies on that path
 // (`input`, `instructions`, `reasoning`, ...), so this handler is just a
 // thin wrapper that parses the body and routes it through the passthrough.
-async function handleChatCompletions(
-  req: Request,
-  ctx: RequestCtx,
-): Promise<Response> {
+async function handleChatCompletions(req: Request, ctx: RequestCtx): Promise<Response> {
   const rawBody = await req.text();
   let parsed: Record<string, unknown>;
   try {
@@ -181,9 +171,7 @@ async function handleChatCompletions(
   if (!parsed || typeof parsed !== "object" || !Array.isArray(parsed["input"])) {
     logIncomingBody("unsupported-shape", req, rawBody);
     const presentKeys =
-      parsed && typeof parsed === "object"
-        ? Object.keys(parsed).join(", ")
-        : "(non-object)";
+      parsed && typeof parsed === "object" ? Object.keys(parsed).join(", ") : "(non-object)";
     return Response.json(
       {
         error: {
@@ -226,7 +214,8 @@ async function* tapEvents(
   for await (const event of events) {
     if (event["type"] === "response.output_item.added") {
       const item = event["item"] as Record<string, unknown> | undefined;
-      if (item?.["type"] === "function_call") hadToolCall = true;
+      const t = item?.["type"];
+      if (t === "function_call" || t === "custom_tool_call") hadToolCall = true;
     }
     if (event["type"] === "response.completed") {
       const resp = event["response"] as Record<string, unknown> | undefined;
@@ -258,24 +247,22 @@ function mapStatusToFinishReason(status: string | null): string | null {
 // Like `mapStatusToFinishReason`, but inspects the completed response's
 // output for function_call items so chat-completions consumers (Cursor) see
 // the canonical `tool_calls` finish reason instead of a generic `stop`.
-function deriveFinishReason(
-  resp: Record<string, unknown> | undefined,
-): string | null {
-  const status =
-    typeof resp?.["status"] === "string" ? (resp!["status"] as string) : null;
-  const output = Array.isArray(resp?.["output"])
-    ? (resp!["output"] as unknown[])
-    : [];
+function deriveFinishReason(resp: Record<string, unknown> | undefined): string | null {
+  const status = typeof resp?.["status"] === "string" ? (resp!["status"] as string) : null;
+  const output = Array.isArray(resp?.["output"]) ? (resp!["output"] as unknown[]) : [];
   for (const item of output) {
     const it = item as Record<string, unknown> | undefined;
-    if (it?.["type"] === "function_call") return "tool_calls";
+    const t = it?.["type"];
+    if (t === "function_call" || t === "custom_tool_call") return "tool_calls";
   }
   return mapStatusToFinishReason(status);
 }
 
 // Fields the Codex backend's Responses API accepts. Anything else (`user`,
 // `prompt_cache_retention`, `metadata`, `stream_options`, ...) is silently
-// dropped to avoid 400s from the upstream schema validator.
+// dropped to avoid 400s from the upstream schema validator. (Cursor sends
+// `prompt_cache_retention` but the Codex Responses backend rejects it with
+// `Unsupported parameter`.)
 const RESPONSES_ALLOWED_FIELDS = new Set([
   "model",
   "instructions",
@@ -315,10 +302,19 @@ async function handleResponsesPassthrough(
     preview: ctx.config.logLevel === "verbose" ? extractInputPreview(sanitized["input"]) : null,
   });
 
+  if (ctx.config.logLevel === "verbose") {
+    // Full upstream body so failing turns (e.g. model returns `stop` instead
+    // of calling an edit tool) can be diffed against working clients like
+    // cliproxyapi. One-line JSON keeps it grep-friendly.
+    process.stderr.write(
+      `\x1b[90m[upstream-body]\x1b[0m ${JSON.stringify({ ...sanitized, stream: true })}\n`,
+    );
+  }
+
   const abort = new AbortController();
   req.signal.addEventListener("abort", () => abort.abort(), { once: true });
 
-  let stream;
+  let stream: UpstreamStream;
   try {
     stream = await ctx.upstream.stream({
       body: { ...sanitized, stream: true },
@@ -411,7 +407,11 @@ async function handleResponsesPassthrough(
 }
 
 async function handleResponsesNonStreaming(
-  stream: { events: AsyncIterable<Record<string, unknown>>; upstreamRequestId: string | null; serverModel: string | null },
+  stream: {
+    events: AsyncIterable<Record<string, unknown>>;
+    upstreamRequestId: string | null;
+    serverModel: string | null;
+  },
   logger: RequestLogger,
 ): Promise<Response> {
   let final: Record<string, unknown> | null = null;
@@ -486,9 +486,22 @@ function sanitizeResponsesRequest(
   // different efforts). Fall back to the configured default only when the
   // client didn't supply one, so direct curl tests still get a sensible
   // value.
-  const reasoning = { ...((out["reasoning"] as Record<string, unknown> | undefined) ?? {}) };
+  const reasoning = { ...(out["reasoning"] as Record<string, unknown> | undefined) };
   if (typeof reasoning["effort"] !== "string") reasoning["effort"] = effort;
   out["reasoning"] = reasoning;
+  // Match the codex CLI / cliproxyapi: with `store: false` the backend only
+  // emits `encrypted_content` on reasoning items when the request opts in via
+  // `include`. Cursor preserves reasoning traces across turns (see
+  // https://cursor.com/blog/codex-model-harness#preserving-reasoning-traces),
+  // and a follow-up turn that ships those items without `encrypted_content`
+  // is rejected by the Codex backend \u2014 which manifests as tool-call
+  // turns (e.g. edits) failing while single-turn reads succeed.
+  const include = Array.isArray(out["include"]) ? [...(out["include"] as unknown[])] : [];
+  if (!include.includes("reasoning.encrypted_content")) include.push("reasoning.encrypted_content");
+  out["include"] = include;
+  // Codex CLI / cliproxyapi default: let the model emit multiple tool calls
+  // per turn unless the client explicitly opts out.
+  if (typeof out["parallel_tool_calls"] !== "boolean") out["parallel_tool_calls"] = true;
   return out;
 }
 
@@ -515,8 +528,7 @@ function liftSystemInstructions(
     }
     remaining.push(item);
   }
-  const baseInstructions =
-    typeof existingInstructions === "string" ? existingInstructions : "";
+  const baseInstructions = typeof existingInstructions === "string" ? existingInstructions : "";
   const combined = [baseInstructions, ...systemText]
     .filter((s) => s && s.trim().length > 0)
     .join("\n\n");
@@ -560,25 +572,20 @@ function formatChatCompletionEvent(
       const delta = event["delta"];
       if (typeof delta !== "string" || delta.length === 0) return null;
       return (
-        formatAssistantRoleChunk(state) +
-        formatChatCompletionChunk(state, { content: delta }, null)
+        formatAssistantRoleChunk(state) + formatChatCompletionChunk(state, { content: delta }, null)
       );
     }
     case "response.output_item.added":
       return formatToolCallStart(event, state);
     case "response.function_call_arguments.delta":
+    case "response.custom_tool_call_input.delta":
       return formatToolCallArgsDelta(event, state);
     case "response.output_item.done":
       return formatToolCallDone(event, state);
     case "response.completed": {
       const resp = event["response"] as Record<string, unknown> | undefined;
-      const finish = state.hadToolCall
-        ? "tool_calls"
-        : deriveFinishReason(resp) ?? "stop";
-      return (
-        formatAssistantRoleChunk(state) +
-        formatChatCompletionChunk(state, {}, finish)
-      );
+      const finish = state.hadToolCall ? "tool_calls" : (deriveFinishReason(resp) ?? "stop");
+      return formatAssistantRoleChunk(state) + formatChatCompletionChunk(state, {}, finish);
     }
     case "response.failed":
       return formatChatCompletionError(extractResponseError(event));
@@ -622,12 +629,17 @@ function formatToolCallStart(
   state: ChatCompletionStreamState,
 ): string | null {
   const item = event["item"] as Record<string, unknown> | undefined;
-  if (!item || item["type"] !== "function_call") return null;
+  // Cursor declares some tools (e.g. `ApplyPatch`) as `type: custom` with a
+  // grammar; the upstream emits those as `custom_tool_call` items instead of
+  // `function_call`. Both translate to the same chat-completions tool_calls
+  // shape \u2014 the only on-the-wire difference is `input` (custom) vs
+  // `arguments` (function) for the freeform / JSON payload.
+  const itemType = item?.["type"];
+  if (!item || (itemType !== "function_call" && itemType !== "custom_tool_call")) return null;
   const itemId = typeof item["id"] === "string" ? (item["id"] as string) : null;
   if (!itemId || state.toolCalls.has(itemId)) return null;
   const slot = state.nextSlot++;
-  const callId =
-    typeof item["call_id"] === "string" ? (item["call_id"] as string) : itemId;
+  const callId = typeof item["call_id"] === "string" ? (item["call_id"] as string) : itemId;
   const name = typeof item["name"] === "string" ? (item["name"] as string) : "";
   state.toolCalls.set(itemId, { slot, argsLen: 0, callId, name });
   state.hadToolCall = true;
@@ -658,8 +670,7 @@ function formatToolCallArgsDelta(
 ): string | null {
   const delta = event["delta"];
   if (typeof delta !== "string" || delta.length === 0) return null;
-  const itemId =
-    typeof event["item_id"] === "string" ? (event["item_id"] as string) : null;
+  const itemId = typeof event["item_id"] === "string" ? (event["item_id"] as string) : null;
   if (!itemId) return null;
   const tc = state.toolCalls.get(itemId);
   if (!tc) return null;
@@ -679,13 +690,14 @@ function formatToolCallDone(
   state: ChatCompletionStreamState,
 ): string | null {
   const item = event["item"] as Record<string, unknown> | undefined;
-  if (!item || item["type"] !== "function_call") return null;
+  const itemType = item?.["type"];
+  if (!item || (itemType !== "function_call" && itemType !== "custom_tool_call")) return null;
   const itemId = typeof item["id"] === "string" ? (item["id"] as string) : null;
   if (!itemId) return null;
   const tc = state.toolCalls.get(itemId);
   if (!tc) return null;
   if (tc.argsLen > 0) return null;
-  const args = item["arguments"];
+  const args = itemType === "custom_tool_call" ? item["input"] : item["arguments"];
   if (typeof args !== "string" || args.length === 0) return null;
   tc.argsLen = args.length;
   return formatChatCompletionChunk(
@@ -700,34 +712,30 @@ function formatChatCompletionChunk(
   delta: Record<string, unknown>,
   finishReason: string | null,
 ): string {
-  return (
-    `data: ${JSON.stringify({
-      id: state.id,
-      object: "chat.completion.chunk",
-      created: state.created,
-      model: state.model,
-      choices: [
-        {
-          index: 0,
-          delta,
-          logprobs: null,
-          finish_reason: finishReason,
-        },
-      ],
-    })}\n\n`
-  );
+  return `data: ${JSON.stringify({
+    id: state.id,
+    object: "chat.completion.chunk",
+    created: state.created,
+    model: state.model,
+    choices: [
+      {
+        index: 0,
+        delta,
+        logprobs: null,
+        finish_reason: finishReason,
+      },
+    ],
+  })}\n\n`;
 }
 
 function formatChatCompletionError(message: string): string {
-  return (
-    `data: ${JSON.stringify({
-      error: {
-        message,
-        type: "server_error",
-        code: null,
-      },
-    })}\n\n`
-  );
+  return `data: ${JSON.stringify({
+    error: {
+      message,
+      type: "server_error",
+      code: null,
+    },
+  })}\n\n`;
 }
 
 function extractResponseError(event: Record<string, unknown>): string {
@@ -749,7 +757,11 @@ function extractInputPreview(input: unknown): string | null {
   if (!Array.isArray(input)) return null;
   for (let i = input.length - 1; i >= 0; i--) {
     const item = input[i] as Record<string, unknown> | undefined;
-    if (!item || item["role"] === "system" || item["type"] !== "message" && item["role"] !== "user") {
+    if (
+      !item ||
+      item["role"] === "system" ||
+      (item["type"] !== "message" && item["role"] !== "user")
+    ) {
       // Fall back to any user item even when shape varies.
       if (item?.["role"] !== "user") continue;
     }
