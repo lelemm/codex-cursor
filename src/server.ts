@@ -486,7 +486,7 @@ function sanitizeResponsesRequest(
   // different efforts). Fall back to the configured default only when the
   // client didn't supply one, so direct curl tests still get a sensible
   // value.
-  const reasoning = { ...((out["reasoning"] as Record<string, unknown> | undefined) ?? {}) };
+  const reasoning = { ...(out["reasoning"] as Record<string, unknown> | undefined) };
   if (typeof reasoning["effort"] !== "string") reasoning["effort"] = effort;
   out["reasoning"] = reasoning;
   // Match the codex CLI / cliproxyapi: with `store: false` the backend only
