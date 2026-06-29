@@ -28,6 +28,25 @@ bun install
 bun run src/index.ts --api-key "$(openssl rand -hex 16)"
 ```
 
+From a clone, the easiest Cursor setup is the localtunnel helper:
+
+```bash
+bun install
+bun run tunnel
+```
+
+That command generates a random API key, starts the proxy from source on
+`127.0.0.1:4141`, installs `localtunnel` globally with npm if needed, starts a
+public tunnel, and prints the exact values to paste into Cursor:
+
+```text
+Cursor OpenAI API Key:  <generated-key>
+Cursor OpenAI Base URL: https://example.loca.lt/v1
+```
+
+Leave the process running while using Cursor. Press `Ctrl+C` to stop both the
+proxy and the tunnel.
+
 Flags / env vars:
 
 | Flag                     | Env var                       | Default               |
@@ -48,7 +67,10 @@ Cursor's chat runs on Cursor's cloud backend, which calls your custom base
 URL. It refuses private addresses, so `http://127.0.0.1:4141/v1` will fail
 with `Access to private networks is forbidden`.
 
-Use a [Cloudflare quick tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/do-more-with-tunnels/trycloudflare/):
+From a clone, `bun run tunnel` does this automatically using localtunnel and
+prints a `https://...loca.lt/v1` base URL plus the generated API key.
+
+Alternatively, use a [Cloudflare quick tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/do-more-with-tunnels/trycloudflare/):
 
 ```bash
 brew install cloudflared
