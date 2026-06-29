@@ -147,14 +147,15 @@ function handleListModels(): Response {
 }
 
 // `/v1/chat/completions` is what Cursor's "Custom OpenAI Base URL" override
-// targets. Cursor 1.0+ sends Responses-API-shaped bodies on that path
-// (`input`, `instructions`, `reasoning`, ...), so this handler is just a
-// thin wrapper that parses the body and routes it through the passthrough.
+// targets. Cursor versions vary here: some send Responses-shaped bodies on
+// this path (`input`, `instructions`, `reasoning`, ...), while others send the
+// normal Chat Completions shape (`messages`, nested `tools`, ...). Normalize
+// both into the Codex backend's Responses body before forwarding.
 async function handleChatCompletions(req: Request, ctx: RequestCtx): Promise<Response> {
   const rawBody = await req.text();
-  let parsed: Record<string, unknown>;
+  let parsed: unknown;
   try {
-    parsed = JSON.parse(rawBody) as Record<string, unknown>;
+    parsed = JSON.parse(rawBody) as unknown;
   } catch (err) {
     logIncomingBody("invalid-json", req, rawBody);
     return Response.json(
@@ -168,16 +169,14 @@ async function handleChatCompletions(req: Request, ctx: RequestCtx): Promise<Res
     );
   }
 
-  if (!parsed || typeof parsed !== "object" || !Array.isArray(parsed["input"])) {
+  if (!isRecord(parsed)) {
     logIncomingBody("unsupported-shape", req, rawBody);
-    const presentKeys =
-      parsed && typeof parsed === "object" ? Object.keys(parsed).join(", ") : "(non-object)";
     return Response.json(
       {
         error: {
           message:
-            `this proxy only accepts OpenAI Responses-API bodies (with an "input" array). ` +
-            `Got keys: [${presentKeys}]. See README "How it works" for the request shape.`,
+            `request body must be a JSON object; got ` +
+            `${Array.isArray(parsed) ? "array" : typeof parsed}`,
           type: "invalid_request_error",
         },
       },
@@ -185,7 +184,291 @@ async function handleChatCompletions(req: Request, ctx: RequestCtx): Promise<Res
     );
   }
 
-  return handleResponsesPassthrough(req, ctx, parsed);
+  const responsesBody = normalizeOpenAiCompatibleRequest(parsed);
+  if (!responsesBody) {
+    logIncomingBody("unsupported-shape", req, rawBody);
+    const presentKeys = Object.keys(parsed).join(", ");
+    return Response.json(
+      {
+        error: {
+          message:
+            `this proxy accepts either OpenAI Responses-API bodies (with an "input" array) ` +
+            `or Chat Completions bodies (with a "messages" array). Got keys: [${presentKeys}].`,
+          type: "invalid_request_error",
+        },
+      },
+      { status: 400 },
+    );
+  }
+
+  return handleResponsesPassthrough(req, ctx, responsesBody);
+}
+
+export function normalizeOpenAiCompatibleRequest(
+  raw: Record<string, unknown>,
+): Record<string, unknown> | null {
+  if (Array.isArray(raw["input"])) return raw;
+  if (Array.isArray(raw["messages"])) return chatCompletionsToResponsesRequest(raw);
+  return null;
+}
+
+const CHAT_COMPLETIONS_RESPONSES_PASSTHROUGH_FIELDS = new Set([
+  "model",
+  "stream",
+  "parallel_tool_calls",
+  "reasoning",
+  "service_tier",
+  "prompt_cache_key",
+  "include",
+  "text",
+  "client_metadata",
+]);
+
+function chatCompletionsToResponsesRequest(
+  raw: Record<string, unknown>,
+): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(raw)) {
+    if (CHAT_COMPLETIONS_RESPONSES_PASSTHROUGH_FIELDS.has(key)) out[key] = value;
+  }
+
+  if (!isRecord(out["client_metadata"]) && isRecord(raw["metadata"])) {
+    out["client_metadata"] = raw["metadata"];
+  }
+
+  const converted = convertChatMessages(raw["messages"]);
+  out["input"] = converted.input;
+  if (converted.instructions) {
+    out["instructions"] = converted.instructions;
+  } else if (typeof raw["instructions"] === "string") {
+    out["instructions"] = raw["instructions"];
+  }
+
+  const tools = convertChatTools(raw["tools"]);
+  if (tools) out["tools"] = tools;
+
+  const toolChoice = convertChatToolChoice(raw["tool_choice"]);
+  out["tool_choice"] = toolChoice ?? "auto";
+
+  return out;
+}
+
+function convertChatMessages(messages: unknown): {
+  input: Record<string, unknown>[];
+  instructions: string;
+} {
+  const input: Record<string, unknown>[] = [];
+  const instructionParts: string[] = [];
+  const items = Array.isArray(messages) ? messages : [];
+
+  for (const item of items) {
+    if (!isRecord(item)) continue;
+    const role = typeof item["role"] === "string" ? item["role"] : "";
+    if (role === "system" || role === "developer") {
+      const text = stringifyChatTextContent(item["content"]);
+      if (text) instructionParts.push(text);
+      continue;
+    }
+
+    if (role === "tool" || role === "function") {
+      const callId =
+        typeof item["tool_call_id"] === "string"
+          ? (item["tool_call_id"] as string)
+          : typeof item["name"] === "string"
+            ? (item["name"] as string)
+            : null;
+      if (callId) {
+        input.push({
+          type: "function_call_output",
+          call_id: callId,
+          output: stringifyChatToolOutput(item["content"]),
+        });
+      }
+      continue;
+    }
+
+    const normalizedRole = role === "assistant" ? "assistant" : "user";
+    const content = chatContentToResponsesContent(item["content"], normalizedRole);
+    if (content.length > 0) {
+      input.push({
+        type: "message",
+        role: normalizedRole,
+        content,
+      });
+    }
+
+    if (normalizedRole === "assistant") {
+      appendAssistantToolCalls(item["tool_calls"], input);
+    }
+  }
+
+  return { input, instructions: instructionParts.join("\n\n") };
+}
+
+function appendAssistantToolCalls(
+  toolCalls: unknown,
+  input: Record<string, unknown>[],
+): void {
+  if (!Array.isArray(toolCalls)) return;
+  for (const call of toolCalls) {
+    if (!isRecord(call)) continue;
+    const callId = typeof call["id"] === "string" ? (call["id"] as string) : null;
+    if (!callId) continue;
+
+    const fn = isRecord(call["function"]) ? call["function"] : null;
+    const name =
+      typeof fn?.["name"] === "string"
+        ? (fn["name"] as string)
+        : typeof call["name"] === "string"
+          ? (call["name"] as string)
+          : "";
+    if (!name) continue;
+
+    input.push({
+      type: "function_call",
+      call_id: callId,
+      name,
+      arguments: stringifyToolArguments(fn?.["arguments"]),
+    });
+  }
+}
+
+function convertChatTools(tools: unknown): Record<string, unknown>[] | undefined {
+  if (!Array.isArray(tools)) return undefined;
+  const converted: Record<string, unknown>[] = [];
+  for (const tool of tools) {
+    if (!isRecord(tool)) continue;
+    if (tool["type"] === "function" && isRecord(tool["function"])) {
+      const fn = tool["function"];
+      if (typeof fn["name"] !== "string") continue;
+      const out: Record<string, unknown> = {
+        type: "function",
+        name: fn["name"],
+      };
+      copyIfPresent(fn, out, "description");
+      copyIfPresent(fn, out, "parameters");
+      copyIfPresent(fn, out, "strict");
+      converted.push(out);
+      continue;
+    }
+    converted.push({ ...tool });
+  }
+  return converted.length > 0 ? converted : undefined;
+}
+
+function convertChatToolChoice(choice: unknown): unknown {
+  if (choice === undefined) return undefined;
+  if (typeof choice === "string") return choice;
+  if (isRecord(choice) && choice["type"] === "function" && isRecord(choice["function"])) {
+    const name = choice["function"]["name"];
+    if (typeof name === "string") return { type: "function", name };
+  }
+  return choice;
+}
+
+function chatContentToResponsesContent(
+  content: unknown,
+  role: "user" | "assistant",
+): Record<string, unknown>[] {
+  const textType = role === "assistant" ? "output_text" : "input_text";
+  if (typeof content === "string") {
+    return content ? [{ type: textType, text: content }] : [];
+  }
+  if (!Array.isArray(content)) return [];
+
+  const out: Record<string, unknown>[] = [];
+  for (const part of content) {
+    if (typeof part === "string") {
+      if (part) out.push({ type: textType, text: part });
+      continue;
+    }
+    if (!isRecord(part)) continue;
+
+    const partType = part["type"];
+    if (
+      (partType === "text" || partType === "input_text" || partType === "output_text") &&
+      typeof part["text"] === "string"
+    ) {
+      out.push({ type: textType, text: part["text"] });
+      continue;
+    }
+
+    if (partType === "image_url" && role === "user") {
+      const image = part["image_url"];
+      const url =
+        typeof image === "string"
+          ? image
+          : isRecord(image) && typeof image["url"] === "string"
+            ? (image["url"] as string)
+            : null;
+      if (url) {
+        const imagePart: Record<string, unknown> = { type: "input_image", image_url: url };
+        const detail = isRecord(image) ? image["detail"] : part["detail"];
+        if (typeof detail === "string") imagePart["detail"] = detail;
+        out.push(imagePart);
+      }
+      continue;
+    }
+
+    if (partType === "input_image" && role === "user") {
+      const url = typeof part["image_url"] === "string" ? (part["image_url"] as string) : null;
+      if (url) {
+        const imagePart: Record<string, unknown> = { type: "input_image", image_url: url };
+        if (typeof part["detail"] === "string") imagePart["detail"] = part["detail"];
+        out.push(imagePart);
+      }
+    }
+  }
+  return out;
+}
+
+function stringifyChatTextContent(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  const parts: string[] = [];
+  for (const part of content) {
+    if (typeof part === "string") {
+      parts.push(part);
+      continue;
+    }
+    if (isRecord(part) && typeof part["text"] === "string") {
+      parts.push(part["text"] as string);
+    }
+  }
+  return parts.join("");
+}
+
+function stringifyChatToolOutput(content: unknown): string {
+  const text = stringifyChatTextContent(content);
+  if (text) return text;
+  if (content == null) return "";
+  try {
+    return JSON.stringify(content);
+  } catch {
+    return String(content);
+  }
+}
+
+function stringifyToolArguments(args: unknown): string {
+  if (typeof args === "string") return args;
+  if (args == null) return "{}";
+  try {
+    return JSON.stringify(args);
+  } catch {
+    return String(args);
+  }
+}
+
+function copyIfPresent(
+  from: Record<string, unknown>,
+  to: Record<string, unknown>,
+  key: string,
+): void {
+  if (Object.prototype.hasOwnProperty.call(from, key)) to[key] = from[key];
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 // Dumps an incoming request body that the proxy couldn't translate. Useful
